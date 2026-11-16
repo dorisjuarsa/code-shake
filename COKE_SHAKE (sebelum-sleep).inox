@@ -1,0 +1,1328 @@
+/**
+ * COKE_SHAKE.ino
+ * 
+ * Interactive Coca-Cola Bottle Controller
+ * Hardware: Waveshare ESP32-S3-Touch-LCD-1.83 (ST7789P + CST816T + QMI8658 + AXP2101 + ES8311)
+ * 
+ * BLE Game Protocol:
+ * - Device Names: COCA-COLA-BOTTLE-01 / COCA-COLA-BOTTLE-02
+ * - Service UUID:        19b10000-e8f2-537e-4f6c-d104768a1214
+ * - Characteristic UUID: 19b10001-e8f2-537e-4f6c-d104768a1214 (NOTIFY | READ)
+ * - Payload Format:      SHAKE,<id>,<intensity> (e.g. SHAKE,1,75)
+ * 
+ * Features:
+ * 1. Omni-directional Peak-to-Peak Bipolar Shake Filter (Zero false triggers).
+ * 2. Tuned for natural 30cm human hand shaking (Sensitivity 0.10g - 2.00g).
+ * 3. Dual Sliders: FORCE (0.10g - 2.00g) & SPEED (Ultra-Fast 5ms - Normal 100ms).
+ * 4. Inverted-contrast slider text rendered directly inside bars to maximize screen area.
+ * 5. Nokia Pager / Smartwatch Carousel Settings (5-page carousel with < PREV & NEXT >).
+ * 6. Interactive Touch Drag Slider for Brightness (PWM 5-255).
+ * 7. Mini Oscilloscope with 100% full-width wave & dynamic curve amplification.
+ * 8. Safe curved-bezel header layout with Vector Battery & Vector BLE icons.
+ * 9. Zero-flicker Home screen (no periodic full-screen wipe).
+ * 10. Auto-Sleep timer selector (1 to 5 min / Never).
+ * 11. RTC RAM Sequence Counter (#1, #2, #3...) immune to Flash wear & sleep reset.
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Preferences.h>
+#include <NimBLEDevice.h>
+#include <NimBLEServer.h>
+#include "pin_config.h"
+#include "Arduino_GFX_Library.h"
+#include "Arduino_DriveBus_Library.h"
+#include "SensorQMI8658.hpp"
+#include "XPowersLib.h"
+
+// ==========================================
+// 1. CONFIGURATION & CONSTANTS
+// ==========================================
+#define DEFAULT_BOTTLE_ID  1
+#define BOOT_BTN_PIN       0
+
+// Audio Amplifier Shutdown Pin (Held LOW for 0 mA silent operation)
+#define AUDIO_PA_PIN       46
+
+// Display Dimensions
+#define SCR_W              240
+#define SCR_H              284
+#define MARGIN_X           16
+#define HEADER_SAFE_X      22  // Offset to safely clear curved glass corners
+
+// Modern AMOLED Colors (16-bit RGB565)
+#define COLOR_BG           0x0000 // Deep AMOLED Black
+#define COLOR_COKE_RED     0xE904 // Official Coca-Cola Crimson Red
+#define COLOR_CARD_BG      0x18C3 // Dark Charcoal Slate
+#define COLOR_CARD_BRD     0x39E7 // Border Grey
+#define COLOR_WHITE        0xFFFF // Pure White
+#define COLOR_TEXT_DIM     0x9CD3 // Subdued Grey
+#define COLOR_GREEN        0x07E0 // Vivid Emerald Green
+#define COLOR_CYAN         0x07FF // Neon BLE Cyan
+#define COLOR_YELLOW       0xFDE0 // Warning Yellow
+
+// BLE UUIDs
+#define GAME_SERVICE_UUID "19b10000-e8f2-537e-4f6c-d104768a1214"
+#define GAME_CHAR_UUID    "19b10001-e8f2-537e-4f6c-d104768a1214"
+
+// Peripherals & Display
+Arduino_DataBus *bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI);
+Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, true, SCR_W, SCR_H, 0, 0, 0, 0);
+
+std::shared_ptr<Arduino_IIC_DriveBus> IIC_Bus = std::make_shared<Arduino_HWIIC>(IIC_SDA, IIC_SCL, &Wire);
+
+void IIC_Touch_Interrupt_Handler(void);
+std::unique_ptr<Arduino_IIC> CST816T(new Arduino_CST816x(IIC_Bus, CST816T_DEVICE_ADDRESS, TP_RST, TP_INT, IIC_Touch_Interrupt_Handler));
+
+void IIC_Touch_Interrupt_Handler(void) {
+  CST816T->IIC_Interrupt_Flag = true;
+}
+
+// Hardware Objects
+SensorQMI8658 qmi;
+XPowersAXP2101 pmu;
+Preferences prefs;
+
+// BLE Server & Characteristic
+NimBLEServer*         bleServer = nullptr;
+NimBLECharacteristic* shakeChar = nullptr;
+bool isBleConnected = false;
+
+// ==========================================
+// APPLICATION STATE MACHINE
+// ==========================================
+enum ScreenState {
+  STATE_HOME,
+  STATE_SETTINGS,
+  STATE_SET_COUNTER
+};
+
+ScreenState currentState = STATE_HOME;
+int currentSettingsPage = 0; // 0: Device ID, 1: Counter ID, 2: Brightness, 3: Shake Diag, 4: Auto Sleep
+const int TOTAL_SETTINGS_PAGES = 5;
+
+// Settings (Saved in NVS)
+int bottleNumber = DEFAULT_BOTTLE_ID;   // 1 or 2
+float shakeThreshold = 0.35f;           // Range: 0.10g to 2.00g (Default 0.35g)
+int shakeCooldownMs = 30;               // Range: 5ms (Ultra Fast) to 100ms (Normal) (Default 30ms)
+int brightnessPWM = 160;                // Range: 5 (Super dim) to 255 (Full bright)
+int sleepTimerMinutes = 0;              // 0: Never, 1, 2, 3, 5 minutes
+
+// RTC RAM Shake Counter (Preserves across sleep without Flash wear)
+RTC_DATA_ATTR uint32_t shakeCounter = 1;
+
+// ==========================================
+// OMNI-DIRECTIONAL PEAK-TO-PEAK SHAKE ENGINE
+// ==========================================
+enum ShakeP2PState {
+  P2P_IDLE,
+  P2P_WAIT_REVERSE,
+  P2P_COOLDOWN
+};
+
+ShakeP2PState p2pState = P2P_IDLE;
+float p2pFirstPeakX = 0.0f;
+float p2pFirstPeakY = 0.0f;
+float p2pFirstPeakZ = 0.0f;
+float p2pFirstPeakMag = 0.0f;
+unsigned long p2pFirstPeakTime = 0;
+unsigned long lastValidShakeTime = 0;
+
+// Diagnostics Waveform Buffer (for Mini Oscilloscope)
+const int WAVE_BUFFER_SIZE = 40;
+float waveBuffer[WAVE_BUFFER_SIZE];
+int waveBufIndex = 0;
+unsigned long lastWaveSampleTime = 0;
+
+// Diagnostics Display Status
+bool  diagTriggered = false;
+unsigned long diagTriggerTime = 0;
+int   diagLastIntensity = 0;
+
+// Touch Drag State Tracking
+bool isTouching = false;
+int32_t touchDownX = -1;
+int32_t touchDownY = -1;
+int32_t currentTouchX = -1;
+int32_t currentTouchY = -1;
+unsigned long lastTouchSeenTime = 0;
+bool isBrightnessDragging = false;
+bool isForceDragging = false;
+bool isSpeedDragging = false;
+
+// Temporary buffer for Numpad
+String tempInputNumber = "";
+
+// Touch Button Structure
+struct TouchButton {
+  int16_t x, y, w, h;
+  const char* label;
+  uint16_t bgColor;
+  uint16_t textColor;
+
+  bool contains(int32_t tx, int32_t ty) const {
+    return (tx >= x && tx <= (x + w) && ty >= y && ty <= (y + h));
+  }
+};
+
+// Forward Declarations
+void renderHomeScreen();
+void renderSettingsScreen();
+void renderSettingsPageContent();
+void renderNumpadScreen();
+void drawOscilloscopeWaveform();
+void updateDiagStatusBadge(bool triggered, int intensity);
+void updateBrightnessSliderUI();
+void updateDualSlidersUI();
+void handleForceDrag(int32_t curX);
+void handleSpeedDrag(int32_t curX);
+void applyBrightnessPWM(int pwm);
+void sendShakeData(int intensity);
+String getBottleFullName();
+void initBle();
+void loadSettings();
+void saveSettings();
+
+String getBottleFullName() {
+  return (bottleNumber == 2) ? "COCA-COLA-BOTTLE-02" : "COCA-COLA-BOTTLE-01";
+}
+
+// Text Centering Utility
+void drawCenteredText(const char* text, int y, uint16_t color, uint8_t size = 1) {
+  gfx->setTextSize(size);
+  gfx->setTextColor(color);
+  int cardW = SCR_W - (MARGIN_X * 2);
+  int textW = strlen(text) * (6 * size);
+  int tx = MARGIN_X + (cardW - textW) / 2;
+  gfx->setCursor(tx, y);
+  gfx->print(text);
+}
+
+// ==========================================
+// BLE CALLBACKS & SETUP
+// ==========================================
+class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
+    isBleConnected = true;
+    Serial.println("[BLE] >>> GAME CONNECTED! <<<");
+  }
+
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
+    isBleConnected = false;
+    Serial.println("[BLE] --- DISCONNECTED, Restarting Advertising ---");
+    NimBLEDevice::startAdvertising();
+  }
+};
+
+void initBle() {
+  String fullName = getBottleFullName();
+  Serial.printf("[BLE] Starting BLE: %s\n", fullName.c_str());
+
+  NimBLEDevice::init(fullName.c_str());
+  bleServer = NimBLEDevice::createServer();
+  bleServer->setCallbacks(new ServerCallbacks());
+
+  NimBLEService* pService = bleServer->createService(GAME_SERVICE_UUID);
+  shakeChar = pService->createCharacteristic(
+    GAME_CHAR_UUID,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+  );
+
+  shakeChar->setValue("SHAKE,0,0");
+  pService->start();
+  bleServer->start();
+
+  NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
+  advertising->setName(fullName.c_str());
+  advertising->addServiceUUID(GAME_SERVICE_UUID);
+  advertising->start();
+  Serial.printf("[BLE] Advertising as %s\n", fullName.c_str());
+}
+
+void sendShakeData(int intensity) {
+  uint32_t currentId = shakeCounter++;
+  diagLastIntensity = intensity;
+
+  char payload[32];
+  snprintf(payload, sizeof(payload), "SHAKE,%u,%d", currentId, intensity);
+  Serial.printf("[BLE-TX] >>> %s\n", payload);
+
+  if (isBleConnected && shakeChar) {
+    shakeChar->setValue((uint8_t*)payload, strlen(payload));
+    shakeChar->notify();
+  }
+}
+
+int calculateIntensity(float combinedForce) {
+  float maxScale = max(shakeThreshold + 0.8f, 2.8f);
+  float norm = (combinedForce - shakeThreshold) / (maxScale - shakeThreshold);
+  norm = constrain(norm, 0.0f, 1.0f);
+  int intensity = 15 + (int)(norm * 85.0f);
+  return constrain(intensity, 15, 100);
+}
+
+// ==========================================
+// BACKLIGHT PWM CONTROL
+// ==========================================
+void applyBrightnessPWM(int pwm) {
+  brightnessPWM = constrain(pwm, 5, 255);
+  ledcWrite(LCD_BL, brightnessPWM);
+}
+
+// ==========================================
+// NVS SETTINGS PERSISTENCE
+// ==========================================
+void loadSettings() {
+  prefs.begin("cokeshake", false);
+  bottleNumber = prefs.getInt("bot_num", DEFAULT_BOTTLE_ID);
+  shakeThreshold = prefs.getFloat("thresh", 0.35f);
+  shakeThreshold = constrain(shakeThreshold, 0.10f, 2.00f);
+  shakeCooldownMs = prefs.getInt("cooldown", 30);
+  shakeCooldownMs = constrain(shakeCooldownMs, 5, 100);
+  brightnessPWM = prefs.getInt("bright_pwm", 160);
+  sleepTimerMinutes = prefs.getInt("sleep_min", 0);
+  prefs.end();
+}
+
+void saveSettings() {
+  prefs.begin("cokeshake", false);
+  prefs.putInt("bot_num", bottleNumber);
+  prefs.putFloat("thresh", shakeThreshold);
+  prefs.putInt("cooldown", shakeCooldownMs);
+  prefs.putInt("bright_pwm", brightnessPWM);
+  prefs.putInt("sleep_min", sleepTimerMinutes);
+  prefs.end();
+}
+
+// ==========================================
+// VECTOR GRAPHICS & HEADER HELPERS
+// ==========================================
+void drawVectorBattery(int x, int y) {
+  int batt = pmu.getBatteryPercent();
+  bool chg = pmu.isCharging();
+  bool vbus = pmu.isVbusIn();
+
+  // Battery Body Outline (W: 24, H: 12)
+  gfx->drawRoundRect(x, y, 24, 12, 2, COLOR_CARD_BRD);
+  // Terminal Nub
+  gfx->fillRect(x + 24, y + 3, 2, 6, COLOR_CARD_BRD);
+
+  int percent = batt;
+  if (percent <= 0) {
+    uint16_t vbat = pmu.getBattVoltage();
+    if (vbat >= 3300) {
+      percent = constrain((int)((vbat - 3300) * 100 / (4180 - 3300)), 1, 100);
+    } else {
+      percent = 100;
+    }
+  }
+  percent = constrain(percent, 1, 100);
+
+  // Fill Bar
+  int fillW = constrain((percent * 20) / 100, 1, 20);
+  uint16_t barColor = (percent < 20) ? COLOR_COKE_RED : (chg || vbus ? COLOR_CYAN : COLOR_GREEN);
+  gfx->fillRect(x + 2, y + 2, fillW, 8, barColor);
+  gfx->fillRect(x + 2 + fillW, y + 2, 20 - fillW, 8, COLOR_BG);
+
+  // Text label
+  gfx->setTextSize(1);
+  gfx->setTextColor(barColor);
+  gfx->setCursor(x + 30, y + 3);
+  if (vbus) {
+    gfx->print(chg ? "CHG" : "USB");
+  } else {
+    gfx->printf("%d%%", percent);
+  }
+}
+
+void drawVectorBle(int x, int y) {
+  uint16_t col = isBleConnected ? COLOR_CYAN : COLOR_CARD_BRD;
+  // Center stem
+  gfx->drawFastVLine(x + 4, y, 13, col);
+  // Arrows
+  gfx->drawLine(x + 4, y, x + 8, y + 4, col);
+  gfx->drawLine(x + 8, y + 4, x, y + 9, col);
+  gfx->drawLine(x + 4, y + 12, x + 8, y + 8, col);
+  gfx->drawLine(x + 8, y + 8, x, y + 3, col);
+
+  // Status text with comfortable gap before logo
+  gfx->setTextSize(1);
+  gfx->setTextColor(isBleConnected ? COLOR_CYAN : COLOR_TEXT_DIM);
+  gfx->setCursor(x - 38, y + 3);
+  gfx->print(isBleConnected ? "READY" : "WAIT ");
+}
+
+void drawHeader(const char* title) {
+  // Clear header bar
+  gfx->fillRect(0, 0, SCR_W, 44, COLOR_BG);
+
+  // Vector Battery on Left (Safe X >= 22)
+  drawVectorBattery(HEADER_SAFE_X, 7);
+
+  // Vector BLE on Right
+  drawVectorBle(SCR_W - HEADER_SAFE_X - 10, 7);
+
+  // Subtle separator line
+  gfx->drawFastHLine(HEADER_SAFE_X, 21, SCR_W - (HEADER_SAFE_X * 2), COLOR_CARD_BRD);
+
+  // Screen Title (Center, lowered away from top separator line for clean breathing room)
+  gfx->setTextColor(COLOR_WHITE);
+  gfx->setTextSize(1);
+  int textW = strlen(title) * 6;
+  gfx->setCursor((SCR_W - textW) / 2, 30);
+  gfx->print(title);
+}
+
+void drawButton(const TouchButton &btn, bool active = false) {
+  uint16_t bg = active ? COLOR_COKE_RED : btn.bgColor;
+  uint16_t brd = active ? COLOR_WHITE : COLOR_CARD_BRD;
+  gfx->fillRoundRect(btn.x, btn.y, btn.w, btn.h, 8, bg);
+  gfx->drawRoundRect(btn.x, btn.y, btn.w, btn.h, 8, brd);
+
+  gfx->setTextColor(active ? COLOR_WHITE : btn.textColor);
+  gfx->setTextSize(1);
+  int len = strlen(btn.label);
+  int textW = len * 6;
+  int tx = btn.x + (btn.w - textW) / 2;
+  int ty = btn.y + (btn.h - 8) / 2;
+  gfx->setCursor(tx, ty);
+  gfx->print(btn.label);
+}
+
+// ==========================================
+// HOME SCREEN
+// ==========================================
+void renderHomeScreen() {
+  gfx->fillScreen(COLOR_BG);
+  drawHeader("COCA-COLA SHAKE");
+
+  int cardW = SCR_W - (MARGIN_X * 2);
+
+  // Main Identity Card (Matches Settings Menu Card: rounded 10, COLOR_CARD_BG, COLOR_CARD_BRD)
+  int cardY = 44;
+  int cardH = 180;
+  gfx->fillRoundRect(MARGIN_X, cardY, cardW, cardH, 10, COLOR_CARD_BG);
+  gfx->drawRoundRect(MARGIN_X, cardY, cardW, cardH, 10, COLOR_CARD_BRD);
+
+  // Bottle Badge
+  int bY = cardY + 14;
+  gfx->fillRoundRect(MARGIN_X + 16, bY, cardW - 32, 36, 8, COLOR_COKE_RED);
+  gfx->drawRoundRect(MARGIN_X + 16, bY, cardW - 32, 36, 8, COLOR_WHITE);
+  const char* bName = (bottleNumber == 2) ? "BOTTLE-02" : "BOTTLE-01";
+  drawCenteredText(bName, bY + 11, COLOR_WHITE, 2);
+
+  // BLE Connection Pill Status
+  int pillY = cardY + 58;
+  uint16_t pillBg = isBleConnected ? 0x03E0 : 0x2124;
+  uint16_t pillText = isBleConnected ? COLOR_GREEN : COLOR_TEXT_DIM;
+  const char* statusStr = isBleConnected ? "BLE CONNECTED" : "SEARCHING GAME...";
+  gfx->fillRoundRect(MARGIN_X + 24, pillY, cardW - 48, 20, 10, pillBg);
+  gfx->setTextSize(1);
+  gfx->setTextColor(pillText);
+  gfx->setCursor(MARGIN_X + (cardW - strlen(statusStr) * 6) / 2, pillY + 6);
+  gfx->print(statusStr);
+
+  // Information Lines inside the card
+  gfx->setTextColor(COLOR_WHITE);
+  gfx->setTextSize(1);
+  gfx->setCursor(MARGIN_X + 22, cardY + 88);
+  gfx->printf("SHAKE COUNTER : #%u", shakeCounter);
+
+  gfx->setTextColor(COLOR_TEXT_DIM);
+  gfx->setCursor(MARGIN_X + 22, cardY + 106);
+  gfx->printf("Sensitivity   : %.2fg (%dms)", shakeThreshold, shakeCooldownMs);
+
+  gfx->setCursor(MARGIN_X + 22, cardY + 124);
+  gfx->printf("Brightness    : %d%%", (brightnessPWM * 100) / 255);
+
+  // Ready prompt inside card (clean & spacious text, no standalone box)
+  drawCenteredText("READY! SHAKE BOTTLE", cardY + 154, COLOR_GREEN, 1);
+
+  // Settings Button at bottom (matching Settings nav bar)
+  TouchButton btnSettings = { MARGIN_X, 234, (int16_t)cardW, 38, "[ SETTINGS MENU ]", COLOR_CARD_BG, COLOR_WHITE };
+  drawButton(btnSettings);
+}
+
+// ==========================================
+// SETTINGS PAGER (5-PAGE NOKIA / SMARTWATCH CAROUSEL)
+// ==========================================
+void renderSettingsScreen() {
+  gfx->fillScreen(COLOR_BG);
+
+  char titleBuf[32];
+  snprintf(titleBuf, sizeof(titleBuf), "SETTINGS (%d/%d)", currentSettingsPage + 1, TOTAL_SETTINGS_PAGES);
+  drawHeader(titleBuf);
+
+  renderSettingsPageContent();
+
+  // Bottom Navigation Bar
+  TouchButton btnPrev = { MARGIN_X, 234, 66, 38, "< PREV", COLOR_CARD_BG, COLOR_WHITE };
+  TouchButton btnHome = { MARGIN_X + 72, 234, 66, 38, "HOME", COLOR_COKE_RED, COLOR_WHITE };
+  TouchButton btnNext = { MARGIN_X + 144, 234, 66, 38, "NEXT >", COLOR_CARD_BG, COLOR_WHITE };
+
+  drawButton(btnPrev);
+  drawButton(btnHome);
+  drawButton(btnNext);
+}
+
+void renderSettingsPageContent() {
+  int cardW = SCR_W - (MARGIN_X * 2);
+  int contentY = 44;
+  int contentH = 180;
+
+  // Clear page area
+  gfx->fillRect(MARGIN_X, contentY, cardW, contentH, COLOR_BG);
+
+  // Page Card Background
+  gfx->fillRoundRect(MARGIN_X, contentY, cardW, contentH, 10, COLOR_CARD_BG);
+  gfx->drawRoundRect(MARGIN_X, contentY, cardW, contentH, 10, COLOR_CARD_BRD);
+
+  switch (currentSettingsPage) {
+    case 0: { // 1. DEVICE IDENTITY
+      drawCenteredText("SELECT DEVICE", contentY + 12, COLOR_TEXT_DIM, 1);
+
+      // Big Select Button
+      int bY = contentY + 32;
+      gfx->fillRoundRect(MARGIN_X + 16, bY, cardW - 32, 46, 8, COLOR_COKE_RED);
+      gfx->drawRoundRect(MARGIN_X + 16, bY, cardW - 32, 46, 8, COLOR_WHITE);
+      const char* curName = (bottleNumber == 2) ? "BOTTLE-02" : "BOTTLE-01";
+      drawCenteredText(curName, bY + 15, COLOR_WHITE, 2);
+
+      drawCenteredText("Tap Button Bottle 01 <-> 02", contentY + 86, COLOR_YELLOW, 1);
+
+      // Developer Test Trigger Button (replaces "BLE will re-advertise instantly")
+      TouchButton btnSendTest = { (int16_t)(MARGIN_X + 16), (int16_t)(contentY + 116), (int16_t)(cardW - 32), 38, "[ SEND TEST SHAKE ]", 0x1A25, COLOR_YELLOW };
+      drawButton(btnSendTest);
+      break;
+    }
+
+    case 1: { // 2. SHAKE COUNTER ID
+      drawCenteredText("SEQUENCE COUNTER ID", contentY + 16, COLOR_TEXT_DIM, 1);
+
+      // ID Display Box
+      int bY = contentY + 40;
+      gfx->fillRoundRect(MARGIN_X + 16, bY, cardW - 32, 44, 6, 0x0841);
+      gfx->drawRoundRect(MARGIN_X + 16, bY, cardW - 32, 44, 6, COLOR_CARD_BRD);
+      char idStr[16];
+      snprintf(idStr, sizeof(idStr), "#%u", shakeCounter);
+      drawCenteredText(idStr, bY + 14, COLOR_CYAN, 2);
+
+      drawCenteredText("Stored safely in RTC RAM", contentY + 98, COLOR_TEXT_DIM, 1);
+
+      // Edit Button
+      TouchButton btnEdit = { (int16_t)(MARGIN_X + 20), (int16_t)(contentY + 124), (int16_t)(cardW - 40), 38, "[ EDIT NUMBER KEYPAD ]", 0x2945, COLOR_WHITE };
+      drawButton(btnEdit);
+      break;
+    }
+
+    case 2: { // 3. BRIGHTNESS SLIDER
+      drawCenteredText("DISPLAY BRIGHTNESS", contentY + 16, COLOR_TEXT_DIM, 1);
+      updateBrightnessSliderUI();
+      break;
+    }
+
+    case 3: { // 4. SHAKE CALIBRATION (DUAL SLIDERS: FORCE & SPEED)
+      // Top title: SENSITIVITY SET (centered, no values)
+      drawCenteredText("SENSITIVITY SET", contentY + 8, COLOR_WHITE, 1);
+      // Plain text subtitle below title (no border)
+      drawCenteredText("Shake bottle back & forth", contentY + 22, COLOR_TEXT_DIM, 1);
+
+      // Mini Oscilloscope Frame (X: 24, Y: 80, W: 192, H: 34)
+      int oscX = MARGIN_X + 8;
+      int oscY = contentY + 36;
+      int oscW = cardW - 16;
+      int oscH = 34;
+      gfx->fillRect(oscX, oscY, oscW, oscH, 0x0000);
+      gfx->drawRect(oscX, oscY, oscW, oscH, COLOR_CARD_BRD);
+
+      drawOscilloscopeWaveform();
+      updateDualSlidersUI();
+      updateDiagStatusBadge(diagTriggered, diagLastIntensity);
+      break;
+    }
+
+    case 4: { // 5. AUTO SLEEP TIMER
+      drawCenteredText("AUTO SLEEP TIME", contentY + 16, COLOR_TEXT_DIM, 1);
+
+      // Big Option Card
+      int optY = contentY + 44;
+      gfx->fillRoundRect(MARGIN_X + 16, optY, cardW - 32, 54, 8, 0x0841);
+      gfx->drawRoundRect(MARGIN_X + 16, optY, cardW - 32, 54, 8, COLOR_CYAN);
+
+      const char* optName = "DISABLED";
+      if (sleepTimerMinutes == 1) optName = "1 MINUTE";
+      else if (sleepTimerMinutes == 2) optName = "2 MINUTES";
+      else if (sleepTimerMinutes == 3) optName = "3 MINUTES";
+      else if (sleepTimerMinutes == 5) optName = "5 MINUTES";
+
+      drawCenteredText(optName, optY + 19, COLOR_CYAN, 2);
+      drawCenteredText("Tap to Change", contentY + 116, COLOR_YELLOW, 1);
+      drawCenteredText("Shake bottle to wake up", contentY + 138, COLOR_TEXT_DIM, 1);
+      break;
+    }
+  }
+}
+
+// ==========================================
+// BRIGHTNESS SLIDER UI (Sleek Clean Pill Bar, No White Artifacts)
+// ==========================================
+void updateBrightnessSliderUI() {
+  if (currentState != STATE_SETTINGS || currentSettingsPage != 2) return;
+  int cardW = SCR_W - (MARGIN_X * 2);
+  int contentY = 44;
+  int trackX = MARGIN_X + 16;
+  int trackY = contentY + 84;
+  int trackW = cardW - 32;
+  int trackH = 26;
+
+  // Percentage Text
+  int pct = (brightnessPWM * 100) / 255;
+  gfx->fillRect(MARGIN_X + 16, contentY + 36, cardW - 32, 42, COLOR_CARD_BG);
+  char pctBuf[32];
+  snprintf(pctBuf, sizeof(pctBuf), "%d%%", pct);
+  drawCenteredText(pctBuf, contentY + 40, COLOR_WHITE, 2);
+
+  const char* subLabel = (brightnessPWM <= 15) ? "(Ultra-Low / Night Saver)" : ((brightnessPWM >= 230) ? "(Max Daylight)" : "(Standard)");
+  drawCenteredText(subLabel, contentY + 62, COLOR_YELLOW, 1);
+
+  // Clean Pill Bar (No floating circle thumb to avoid remnants)
+  gfx->fillRoundRect(trackX, trackY, trackW, trackH, 6, 0x0841);
+  gfx->drawRoundRect(trackX, trackY, trackW, trackH, 6, COLOR_CARD_BRD);
+
+  int fillW = constrain(map(brightnessPWM, 5, 255, 4, trackW - 4), 4, trackW - 4);
+  gfx->fillRoundRect(trackX + 2, trackY + 2, fillW, trackH - 4, 4, COLOR_COKE_RED);
+
+  drawCenteredText("Slide to Setting", contentY + 128, COLOR_TEXT_DIM, 1);
+}
+
+// ==========================================
+// DUAL SLIDERS & DIAGNOSTICS UI (FORCE & SPEED)
+// ==========================================
+void drawBarWithInvertedText(int trackX, int trackY, int trackW, int trackH, int fillW, uint16_t fillColor, const char* label, uint16_t filledTextColor, uint16_t unfilledTextColor) {
+  // Clear and draw track background
+  gfx->fillRoundRect(trackX, trackY, trackW, trackH, 6, 0x0841);
+  gfx->drawRoundRect(trackX, trackY, trackW, trackH, 6, COLOR_CARD_BRD);
+
+  // Draw Fill Progress Bar
+  if (fillW > 0) {
+    gfx->fillRoundRect(trackX + 2, trackY + 2, fillW, trackH - 4, 4, fillColor);
+  }
+
+  // Draw Centered Text with Per-Character Inverted Contrast
+  int textW = strlen(label) * 6;
+  int textX = trackX + (trackW - textW) / 2;
+  int textY = trackY + (trackH - 8) / 2;
+  int fillEndX = trackX + 2 + fillW;
+
+  gfx->setTextSize(1);
+  for (int i = 0; label[i] != '\0'; i++) {
+    int cx = textX + i * 6;
+    if (cx + 3 < fillEndX) {
+      gfx->setTextColor(filledTextColor);
+    } else {
+      gfx->setTextColor(unfilledTextColor);
+    }
+    gfx->setCursor(cx, textY);
+    gfx->print(label[i]);
+  }
+}
+
+void updateDualSlidersUI() {
+  if (currentState != STATE_SETTINGS || currentSettingsPage != 3) return;
+  int cardW = SCR_W - (MARGIN_X * 2);
+  int contentY = 44;
+  int trackX = MARGIN_X + 16;
+  int trackW = cardW - 32;
+  int trackH = 22;
+
+  // 1. Slider 1: FORCE (0.10g - 2.00g)
+  int forceTrackY = contentY + 74;
+  int fillWForce = constrain(map((int)(shakeThreshold * 100), 10, 200, 4, trackW - 4), 4, trackW - 4);
+  char forceBuf[32];
+  snprintf(forceBuf, sizeof(forceBuf), "FORCE : %.2fg", shakeThreshold);
+  drawBarWithInvertedText(trackX, forceTrackY, trackW, trackH, fillWForce, COLOR_COKE_RED, forceBuf, COLOR_WHITE, COLOR_TEXT_DIM);
+
+  // 2. Slider 2: SPEED (Ultra Fast 5ms - Normal 100ms)
+  int speedTrackY = contentY + 100;
+  int fillWSpeed = constrain(map(shakeCooldownMs, 5, 100, 4, trackW - 4), 4, trackW - 4);
+  char speedBuf[32];
+  snprintf(speedBuf, sizeof(speedBuf), "SPEED : %dms", shakeCooldownMs);
+  drawBarWithInvertedText(trackX, speedTrackY, trackW, trackH, fillWSpeed, COLOR_CYAN, speedBuf, 0x0000, COLOR_CYAN);
+}
+
+void drawOscilloscopeWaveform() {
+  if (currentState != STATE_SETTINGS || currentSettingsPage != 3) return;
+  int cardW = SCR_W - (MARGIN_X * 2);
+  int contentY = 44;
+  int oscX = MARGIN_X + 8;
+  int oscY = contentY + 36;
+  int oscW = cardW - 16;
+  int oscH = 34;
+
+  // Clear inner canvas
+  gfx->fillRect(oscX + 1, oscY + 1, oscW - 2, oscH - 2, 0x0000);
+
+  // Redraw threshold line (dotted red, scaled to 2.4g max with comfortable headroom)
+  int threshY = oscY + oscH - 1 - constrain((int)((shakeThreshold / 2.4f) * (oscH - 2)), 1, oscH - 2);
+  for (int tx = oscX + 2; tx < oscX + oscW - 2; tx += 6) {
+    gfx->drawFastHLine(tx, threshY, 3, COLOR_COKE_RED);
+  }
+
+  // Draw Waveform samples (Line spans 100% full width to the right border)
+  for (int i = 0; i < WAVE_BUFFER_SIZE - 1; i++) {
+    int idx1 = (waveBufIndex + i) % WAVE_BUFFER_SIZE;
+    int idx2 = (waveBufIndex + i + 1) % WAVE_BUFFER_SIZE;
+    
+    int x1 = (oscX + 1) + (i * (oscW - 3)) / (WAVE_BUFFER_SIZE - 1);
+    int x2 = (oscX + 1) + ((i + 1) * (oscW - 3)) / (WAVE_BUFFER_SIZE - 1);
+
+    // Dynamic curve amplification (2.4g max scale gives clear view of high-speed human shaking)
+    int y1 = oscY + oscH - 1 - constrain((int)((waveBuffer[idx1] / 2.4f) * (oscH - 2)), 1, oscH - 2);
+    int y2 = oscY + oscH - 1 - constrain((int)((waveBuffer[idx2] / 2.4f) * (oscH - 2)), 1, oscH - 2);
+
+    gfx->drawLine(x1, y1, x2, y2, COLOR_GREEN);
+  }
+}
+
+void updateDiagStatusBadge(bool triggered, int intensity) {
+  if (currentState != STATE_SETTINGS || currentSettingsPage != 3) return;
+  int cardW = SCR_W - (MARGIN_X * 2);
+  int contentY = 44;
+  int statusY = contentY + 128;
+
+  gfx->fillRect(MARGIN_X + 16, statusY, cardW - 32, 12, COLOR_CARD_BG);
+  if (triggered) {
+    char badgeBuf[32];
+    snprintf(badgeBuf, sizeof(badgeBuf), "VALID SHAKE! INT: %d%%", intensity);
+    drawCenteredText(badgeBuf, statusY, COLOR_GREEN, 1);
+  } else {
+    drawCenteredText("Slide bars to calibrate", statusY, COLOR_TEXT_DIM, 1);
+  }
+}
+
+// ==========================================
+// NUMPAD SCREEN (MANUAL COUNTER EDIT)
+// ==========================================
+void updateNumpadDisplay() {
+  int boxW = SCR_W - (MARGIN_X * 2);
+  gfx->fillRoundRect(MARGIN_X, 42, boxW, 34, 6, COLOR_CARD_BG);
+  gfx->drawRoundRect(MARGIN_X, 42, boxW, 34, 6, COLOR_CARD_BRD);
+  gfx->setTextColor(COLOR_WHITE);
+  gfx->setTextSize(2);
+  gfx->setCursor(MARGIN_X + 20, 50);
+  gfx->printf("ID: %-8s", tempInputNumber.c_str());
+}
+
+void renderNumpadScreen() {
+  gfx->fillScreen(COLOR_BG);
+  drawHeader("SET COUNTER ID");
+
+  updateNumpadDisplay();
+
+  int boxW = SCR_W - (MARGIN_X * 2);
+  int padStartX = MARGIN_X;
+  int padStartY = 84;
+  int btnW = (boxW - 12) / 3;
+  int btnH = 34;
+  int stepX = btnW + 6;
+  int stepY = btnH + 6;
+
+  const char* keys[12] = {
+    "1", "2", "3",
+    "4", "5", "6",
+    "7", "8", "9",
+    "CLR", "0", "OK"
+  };
+
+  for (int r = 0; r < 4; r++) {
+    for (int c = 0; c < 3; c++) {
+      int idx = r * 3 + c;
+      uint16_t bg = COLOR_CARD_BG;
+      uint16_t tc = COLOR_WHITE;
+      if (idx == 9)  { bg = 0x5000; }
+      if (idx == 11) { bg = COLOR_COKE_RED; }
+      TouchButton b = { (int16_t)(padStartX + c * stepX), (int16_t)(padStartY + r * stepY), (int16_t)btnW, (int16_t)btnH, keys[idx], bg, tc };
+      drawButton(b);
+    }
+  }
+
+  TouchButton bCancel = { MARGIN_X, (int16_t)(padStartY + 4 * stepY), (int16_t)boxW, 32, "CANCEL", COLOR_CARD_BG, COLOR_TEXT_DIM };
+  drawButton(bCancel);
+}
+
+// ==========================================
+// PHYSICAL BOOT BUTTON (GPIO 0)
+// ==========================================
+void checkBootButton() {
+  static int lastPinState = HIGH;
+  static int debouncedState = HIGH;
+  static unsigned long lastDebounceTime = 0;
+  static unsigned long lastActionTime = 0;
+
+  int reading = digitalRead(BOOT_BTN_PIN);
+  unsigned long now = millis();
+
+  if (reading != lastPinState) {
+    lastDebounceTime = now;
+    lastPinState = reading;
+  }
+
+  if ((now - lastDebounceTime) > 50) {
+    if (reading != debouncedState) {
+      debouncedState = reading;
+      if (debouncedState == HIGH) {
+        if (now - lastActionTime > 300) {
+          lastActionTime = now;
+          Serial.println("[BTN] BOOT Button Pressed -> Refresh to HOME");
+          currentState = STATE_HOME;
+          renderHomeScreen();
+        }
+      }
+    }
+  }
+}
+
+// ==========================================
+// TOUCH HANDLING & DRAGGING
+// ==========================================
+bool readTouchPoint(int32_t *x, int32_t *y) {
+  if (!CST816T->IIC_Interrupt_Flag) {
+    if (digitalRead(TP_INT) == HIGH) return false;
+  }
+  CST816T->IIC_Interrupt_Flag = false;
+
+  int32_t touchX = CST816T->IIC_Read_Device_Value(CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
+  int32_t touchY = CST816T->IIC_Read_Device_Value(CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
+
+  if (touchX < 0 || touchX >= SCR_W || touchY < 0 || touchY >= SCR_H) return false;
+
+  *x = touchX;
+  *y = touchY;
+  return true;
+}
+
+void onTouchPressed(int32_t tx, int32_t ty) {
+  int cardW = SCR_W - (MARGIN_X * 2);
+
+  if (currentState == STATE_HOME) {
+    TouchButton btnSettings = { MARGIN_X, 234, (int16_t)cardW, 38, "", 0, 0 };
+    if (btnSettings.contains(tx, ty)) drawButton(btnSettings, true);
+  }
+  else if (currentState == STATE_SETTINGS) {
+    // Navigation bar buttons highlight
+    TouchButton btnPrev = { MARGIN_X, 234, 66, 38, "< PREV", COLOR_CARD_BG, COLOR_WHITE };
+    TouchButton btnHome = { MARGIN_X + 72, 234, 66, 38, "HOME", COLOR_COKE_RED, COLOR_WHITE };
+    TouchButton btnNext = { MARGIN_X + 144, 234, 66, 38, "NEXT >", COLOR_CARD_BG, COLOR_WHITE };
+    if (btnPrev.contains(tx, ty)) drawButton(btnPrev, true);
+    if (btnHome.contains(tx, ty)) drawButton(btnHome, true);
+    if (btnNext.contains(tx, ty)) drawButton(btnNext, true);
+
+    // Page 0 (Device ID & Send Test Shake)
+    if (currentSettingsPage == 0) {
+      int contentY = 44;
+      TouchButton btnSendTest = { (int16_t)(MARGIN_X + 16), (int16_t)(contentY + 116), (int16_t)(cardW - 32), 38, "", 0, 0 };
+      if (btnSendTest.contains(tx, ty)) drawButton(btnSendTest, true);
+    }
+    // Brightness Page Drag Check
+    else if (currentSettingsPage == 2) {
+      int trackY = 44 + 75;
+      if (ty >= trackY && ty <= trackY + 50 && tx >= MARGIN_X && tx <= MARGIN_X + cardW) {
+        isBrightnessDragging = true;
+      }
+    }
+    // Dual Sliders Drag Check (FORCE & SPEED)
+    else if (currentSettingsPage == 3) {
+      int contentY = 44;
+      int forceTrackY = contentY + 74;  // 118
+      int speedTrackY = contentY + 100; // 144
+      if (ty >= (forceTrackY - 8) && ty <= (forceTrackY + 24) && tx >= MARGIN_X && tx <= MARGIN_X + cardW) {
+        isForceDragging = true;
+        handleForceDrag(tx);
+      } else if (ty >= (speedTrackY - 6) && ty <= (speedTrackY + 24) && tx >= MARGIN_X && tx <= MARGIN_X + cardW) {
+        isSpeedDragging = true;
+        handleSpeedDrag(tx);
+      }
+    }
+  }
+}
+
+void onTouchReleased(int32_t upX, int32_t upY) {
+  int cardW = SCR_W - (MARGIN_X * 2);
+
+  if (currentState == STATE_HOME) {
+    TouchButton btnSettings = { MARGIN_X, 234, (int16_t)cardW, 38, "[ SETTINGS MENU ]", COLOR_CARD_BG, COLOR_WHITE };
+    if (btnSettings.contains(touchDownX, touchDownY) && btnSettings.contains(upX, upY)) {
+      currentState = STATE_SETTINGS;
+      renderSettingsScreen();
+    } else {
+      drawButton(btnSettings, false);
+    }
+  }
+  else if (currentState == STATE_SETTINGS) {
+    TouchButton btnPrev = { MARGIN_X, 234, 66, 38, "< PREV", COLOR_CARD_BG, COLOR_WHITE };
+    TouchButton btnHome = { MARGIN_X + 72, 234, 66, 38, "HOME", COLOR_COKE_RED, COLOR_WHITE };
+    TouchButton btnNext = { MARGIN_X + 144, 234, 66, 38, "NEXT >", COLOR_CARD_BG, COLOR_WHITE };
+
+    if (btnPrev.contains(touchDownX, touchDownY) && btnPrev.contains(upX, upY)) {
+      currentSettingsPage--;
+      if (currentSettingsPage < 0) currentSettingsPage = TOTAL_SETTINGS_PAGES - 1;
+      renderSettingsScreen();
+      return;
+    } else if (btnNext.contains(touchDownX, touchDownY) && btnNext.contains(upX, upY)) {
+      currentSettingsPage++;
+      if (currentSettingsPage >= TOTAL_SETTINGS_PAGES) currentSettingsPage = 0;
+      renderSettingsScreen();
+      return;
+    } else if (btnHome.contains(touchDownX, touchDownY) && btnHome.contains(upX, upY)) {
+      saveSettings();
+      currentState = STATE_HOME;
+      renderHomeScreen();
+      return;
+    }
+
+    // Page Specific Content Taps
+    int contentY = 44;
+    switch (currentSettingsPage) {
+      case 0: { // Device ID Toggle & Send Test Shake
+        TouchButton btnToggle   = { (int16_t)(MARGIN_X + 16), (int16_t)(contentY + 32), (int16_t)(cardW - 32), 46, "", 0, 0 };
+        TouchButton btnSendTest = { (int16_t)(MARGIN_X + 16), (int16_t)(contentY + 116), (int16_t)(cardW - 32), 38, "[ SEND TEST SHAKE ]", 0x1A25, COLOR_YELLOW };
+
+        if (btnToggle.contains(touchDownX, touchDownY) && btnToggle.contains(upX, upY)) {
+          bottleNumber = (bottleNumber == 1) ? 2 : 1;
+          saveSettings();
+          NimBLEDevice::deinit(true);
+          initBle();
+          renderSettingsPageContent();
+        } else if (btnSendTest.contains(touchDownX, touchDownY) && btnSendTest.contains(upX, upY)) {
+          sendShakeData(80);
+          char sentBuf[32];
+          snprintf(sentBuf, sizeof(sentBuf), "[ SENT: SHAKE #%u ]", shakeCounter - 1);
+          TouchButton btnFeedback = { (int16_t)(MARGIN_X + 16), (int16_t)(contentY + 116), (int16_t)(cardW - 32), 38, sentBuf, COLOR_GREEN, COLOR_BG };
+          drawButton(btnFeedback);
+          delay(180);
+          drawButton(btnSendTest, false);
+        } else {
+          drawButton(btnSendTest, false);
+        }
+        break;
+      }
+      case 1: { // Counter Edit
+        TouchButton btnEdit = { (int16_t)(MARGIN_X + 20), (int16_t)(contentY + 124), (int16_t)(cardW - 40), 38, "", 0, 0 };
+        if (btnEdit.contains(touchDownX, touchDownY) && btnEdit.contains(upX, upY)) {
+          tempInputNumber = String(shakeCounter);
+          currentState = STATE_SET_COUNTER;
+          renderNumpadScreen();
+        }
+        break;
+      }
+      case 2: { // Brightness Tap / End Drag
+        isBrightnessDragging = false;
+        saveSettings();
+        break;
+      }
+      case 3: { // Dual Sliders End Drag
+        isForceDragging = false;
+        isSpeedDragging = false;
+        saveSettings();
+        break;
+      }
+      case 4: { // Sleep Timer Cycle
+        TouchButton btnSleep = { (int16_t)(MARGIN_X + 16), (int16_t)(contentY + 44), (int16_t)(cardW - 32), 54, "", 0, 0 };
+        if (btnSleep.contains(touchDownX, touchDownY) && btnSleep.contains(upX, upY)) {
+          // Cycle: 0 -> 1 -> 2 -> 3 -> 5 -> 0
+          if (sleepTimerMinutes == 0) sleepTimerMinutes = 1;
+          else if (sleepTimerMinutes == 1) sleepTimerMinutes = 2;
+          else if (sleepTimerMinutes == 2) sleepTimerMinutes = 3;
+          else if (sleepTimerMinutes == 3) sleepTimerMinutes = 5;
+          else sleepTimerMinutes = 0;
+          saveSettings();
+          renderSettingsPageContent();
+        }
+        break;
+      }
+    }
+  }
+  else if (currentState == STATE_SET_COUNTER) {
+    int padStartX = MARGIN_X;
+    int padStartY = 84;
+    int btnW = (cardW - 12) / 3;
+    int btnH = 34;
+    int stepX = btnW + 6;
+    int stepY = btnH + 6;
+
+    for (int r = 0; r < 4; r++) {
+      for (int c = 0; c < 3; c++) {
+        int idx = r * 3 + c;
+        int bx = padStartX + c * stepX;
+        int by = padStartY + r * stepY;
+        if (touchDownX >= bx && touchDownX <= bx + btnW && touchDownY >= by && touchDownY <= by + btnH &&
+            upX >= bx && upX <= bx + btnW && upY >= by && upY <= by + btnH) {
+          if (idx == 9) { // CLR
+            tempInputNumber = "";
+            updateNumpadDisplay();
+          } else if (idx == 11) { // OK
+            if (tempInputNumber.length() > 0) {
+              shakeCounter = (uint32_t)tempInputNumber.toInt();
+            } else {
+              shakeCounter = 1;
+            }
+            currentState = STATE_SETTINGS;
+            renderSettingsScreen();
+          } else { // Digit 0-9
+            int digit = (idx == 10) ? 0 : (idx + 1);
+            if (tempInputNumber.length() < 7) {
+              tempInputNumber += String(digit);
+              updateNumpadDisplay();
+            }
+          }
+          return;
+        }
+      }
+    }
+    // Cancel button
+    TouchButton bCancel = { MARGIN_X, (int16_t)(padStartY + 4 * stepY), (int16_t)cardW, 32, "", 0, 0 };
+    if (bCancel.contains(touchDownX, touchDownY) && bCancel.contains(upX, upY)) {
+      currentState = STATE_SETTINGS;
+      renderSettingsScreen();
+    }
+  }
+}
+
+// Continuous Drag Handler for Brightness Slider
+void handleBrightnessDrag(int32_t curX) {
+  int cardW = SCR_W - (MARGIN_X * 2);
+  int trackX = MARGIN_X + 16;
+  int trackW = cardW - 32;
+
+  int rawVal = map(curX, trackX, trackX + trackW, 5, 255);
+  int newPWM = constrain(rawVal, 5, 255);
+
+  if (abs(newPWM - brightnessPWM) >= 3) {
+    applyBrightnessPWM(newPWM);
+    updateBrightnessSliderUI();
+  }
+}
+
+// Continuous Drag Handler for FORCE Slider (0.10g to 2.00g)
+void handleForceDrag(int32_t curX) {
+  int cardW = SCR_W - (MARGIN_X * 2);
+  int trackX = MARGIN_X + 16;
+  int trackW = cardW - 32;
+
+  int rawVal = map(curX, trackX, trackX + trackW, 10, 200);
+  float newThresh = constrain(rawVal, 10, 200) / 100.0f;
+
+  if (fabs(newThresh - shakeThreshold) >= 0.02f) {
+    shakeThreshold = newThresh;
+    updateDualSlidersUI();
+    drawOscilloscopeWaveform();
+  }
+}
+
+// Continuous Drag Handler for SPEED Slider (5ms to 100ms)
+void handleSpeedDrag(int32_t curX) {
+  int cardW = SCR_W - (MARGIN_X * 2);
+  int trackX = MARGIN_X + 16;
+  int trackW = cardW - 32;
+
+  int rawVal = map(curX, trackX, trackX + trackW, 5, 100);
+  int newSpeed = constrain(rawVal, 5, 100);
+
+  if (abs(newSpeed - shakeCooldownMs) >= 1) {
+    shakeCooldownMs = newSpeed;
+    updateDualSlidersUI();
+  }
+}
+
+// ==========================================
+// ARDUINO SETUP & INITIALIZATION
+// ==========================================
+void setup() {
+  // Set CPU frequency to 80 MHz for power savings & cool operation
+  setCpuFrequencyMhz(80);
+
+  Serial.begin(115200);
+  delay(50);
+  Serial.println("\n[BOOT] Starting COKE_SHAKE Controller...");
+
+  // BOOT Button Pin
+  pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
+
+  // Initialize I2C Bus for PMIC, IMU, Touch, Audio
+  Wire.begin(IIC_SDA, IIC_SCL);
+  Wire.setClock(400000);
+
+  // Initialize Power Management (AXP2101)
+  if (pmu.begin(Wire, AXP2101_SLAVE_ADDRESS, IIC_SDA, IIC_SCL)) {
+    Serial.println("[PMU] AXP2101 detected. Enabling essential power rails...");
+    pmu.enableBattDetection();
+    pmu.enableVbusVoltageMeasure();
+    pmu.enableBattVoltageMeasure();
+    pmu.enableSystemVoltageMeasure();
+
+    pmu.setDC1Voltage(3300);
+    pmu.enableDC1();
+    
+    // CRITICAL: ALDO1 supplies CST816T Touch Controller
+    pmu.setALDO1Voltage(3300);
+    pmu.enableALDO1();
+
+    pmu.setALDO2Voltage(3300);
+    pmu.enableALDO2();
+    pmu.setALDO3Voltage(3300);
+    pmu.enableALDO3();
+    
+    // ALDO4 supplies 3.3V to ST7789P LCD VCC
+    pmu.setALDO4Voltage(3300);
+    pmu.enableALDO4();
+
+    pmu.setBLDO1Voltage(3300);
+    pmu.enableBLDO1();
+    pmu.setBLDO2Voltage(3300);
+    pmu.enableBLDO2();
+  }
+
+  delay(50);
+
+  // Ensure Audio PA is permanently muted (0 mA power consumption)
+  pinMode(AUDIO_PA_PIN, OUTPUT);
+  digitalWrite(AUDIO_PA_PIN, LOW);
+
+  // Load Settings from NVS
+  loadSettings();
+
+  // Initialize Backlight PWM via LEDC
+  ledcAttach(LCD_BL, 5000, 8);
+  applyBrightnessPWM(brightnessPWM);
+
+  // Hardware Reset & Display Setup
+  pinMode(LCD_RST, OUTPUT);
+  digitalWrite(LCD_RST, HIGH);
+  gfx->begin();
+  Serial.println("[DISPLAY] ST7789 ready");
+
+  // Hardware Reset Touch (CST816T)
+  pinMode(TP_RST, OUTPUT);
+  digitalWrite(TP_RST, LOW);
+  delay(30);
+  digitalWrite(TP_RST, HIGH);
+  delay(50);
+
+  if (CST816T->begin()) {
+    CST816T->IIC_Write_Device_State(CST816T->Arduino_IIC_Touch::Device::TOUCH_DEVICE_INTERRUPT_MODE,
+                                    CST816T->Arduino_IIC_Touch::Device_Mode::TOUCH_DEVICE_INTERRUPT_PERIODIC);
+    Serial.println("[TOUCH] CST816T active");
+  }
+
+  // Initialize IMU (QMI8658) at 250Hz (4ms per sample for instantaneous human hand response)
+  qmi.begin(Wire, QMI8658_L_SLAVE_ADDRESS, IIC_SDA, IIC_SCL);
+  qmi.configAccelerometer(SensorQMI8658::ACC_RANGE_4G, SensorQMI8658::ACC_ODR_250Hz, SensorQMI8658::LPF_MODE_0);
+  qmi.enableAccelerometer();
+
+  // Clear Waveform buffer
+  for (int i = 0; i < WAVE_BUFFER_SIZE; i++) waveBuffer[i] = 0.0f;
+
+  // Initialize Game BLE
+  initBle();
+
+  // Render Initial Home
+  renderHomeScreen();
+  Serial.println("[READY] System initialized successfully!");
+}
+
+// ==========================================
+// MAIN LOOP
+// ==========================================
+void loop() {
+  unsigned long now = millis();
+
+  // 1. Check Boot Button
+  checkBootButton();
+
+  // 2. Read IMU Accelerometer & Run Omni-directional Peak-to-Peak Filter
+  float ax = 0, ay = 0, az = 0;
+  if (qmi.getDataReady()) {
+    qmi.getAccelerometer(ax, ay, az);
+
+    // Fast Low-Pass Filter: Smooths chassis micro-jitter while preserving fast human peaks
+    static float lpfAx = 0, lpfAy = 0, lpfAz = 1.0f;
+    static bool lpfInit = false;
+    if (!lpfInit) {
+      lpfAx = ax; lpfAy = ay; lpfAz = az;
+      lpfInit = true;
+    } else {
+      lpfAx = 0.50f * lpfAx + 0.50f * ax;
+      lpfAy = 0.50f * lpfAy + 0.50f * ay;
+      lpfAz = 0.50f * lpfAz + 0.50f * az;
+    }
+
+    // Dynamic Gravity Baseline Subtraction (Slow ~1.5s tracking at 250Hz: does NOT absorb hand shakes!)
+    static float gX = 0.0f, gY = 0.0f, gZ = 1.0f;
+    static bool gInit = false;
+    if (!gInit) {
+      gX = lpfAx; gY = lpfAy; gZ = lpfAz;
+      gInit = true;
+    } else {
+      gX = 0.998f * gX + 0.002f * lpfAx;
+      gY = 0.998f * gY + 0.002f * lpfAy;
+      gZ = 0.998f * gZ + 0.002f * lpfAz;
+    }
+
+    float dynX = lpfAx - gX;
+    float dynY = lpfAy - gY;
+    float dynZ = lpfAz - gZ;
+    float dynMag = sqrt(dynX * dynX + dynY * dynY + dynZ * dynZ);
+
+    // Sample into Waveform Oscilloscope buffer (every 35ms)
+    if (now - lastWaveSampleTime > 35) {
+      lastWaveSampleTime = now;
+      waveBuffer[waveBufIndex] = dynMag;
+      waveBufIndex = (waveBufIndex + 1) % WAVE_BUFFER_SIZE;
+      if (currentState == STATE_SETTINGS && currentSettingsPage == 3) {
+        drawOscilloscopeWaveform();
+      }
+    }
+
+    // ========================================================
+    // OMNI-DIRECTIONAL PEAK-TO-PEAK ZERO-CROSSING STATE MACHINE
+    // ========================================================
+    switch (p2pState) {
+      case P2P_IDLE: {
+        if (dynMag >= shakeThreshold) {
+          // First peak detected in any 3D direction
+          p2pFirstPeakX = dynX;
+          p2pFirstPeakY = dynY;
+          p2pFirstPeakZ = dynZ;
+          p2pFirstPeakMag = dynMag;
+          p2pFirstPeakTime = now;
+          p2pState = P2P_WAIT_REVERSE;
+        }
+        break;
+      }
+
+      case P2P_WAIT_REVERSE: {
+        unsigned long dt = now - p2pFirstPeakTime;
+        unsigned long maxTurnaround = max(240UL, (unsigned long)(shakeCooldownMs * 4));
+        if (dt > maxTurnaround) {
+          // Timeout: no reverse stroke occurred (was just a bump/tap)
+          p2pState = P2P_IDLE;
+        } else if (dt >= 4) { // Ultra-fast human turnaround cadence (down to 4ms!)
+          // 3D Dot Product between current direction and first stroke
+          float dot = (dynX * p2pFirstPeakX) + (dynY * p2pFirstPeakY) + (dynZ * p2pFirstPeakZ);
+          float oppThresh = -0.15f * (p2pFirstPeakMag * dynMag);
+
+          // Check if direction inverted (bipolar swing) with sufficient magnitude
+          if (dot < oppThresh && dynMag >= (shakeThreshold * 0.60f)) {
+            // CONFIRMED VALID SHAKE!
+            p2pState = P2P_COOLDOWN;
+            lastValidShakeTime = now;
+
+            float combinedForce = (p2pFirstPeakMag + dynMag) * 0.5f;
+            int intensity = calculateIntensity(combinedForce);
+
+            sendShakeData(intensity);
+
+            if (currentState == STATE_HOME) {
+              // Smoothly update counter on home card without full redraw
+              gfx->fillRect(MARGIN_X + 22, 44 + 88, 175, 12, COLOR_CARD_BG);
+              gfx->setTextColor(COLOR_WHITE);
+              gfx->setTextSize(1);
+              gfx->setCursor(MARGIN_X + 22, 44 + 88);
+              gfx->printf("SHAKE COUNTER : #%u", shakeCounter);
+            } else if (currentState == STATE_SETTINGS && currentSettingsPage == 3) {
+              diagTriggered = true;
+              diagTriggerTime = now;
+              diagLastIntensity = intensity;
+              updateDiagStatusBadge(true, intensity);
+            }
+          }
+        }
+        break;
+      }
+
+      case P2P_COOLDOWN: {
+        if (now - lastValidShakeTime >= (unsigned long)shakeCooldownMs) {
+          p2pState = P2P_IDLE;
+        }
+        break;
+      }
+    }
+
+    // Reset Diag trigger highlight after brief pulse
+    if (diagTriggered && (now - diagTriggerTime > 400)) {
+      diagTriggered = false;
+      if (currentState == STATE_SETTINGS && currentSettingsPage == 3) {
+        updateDiagStatusBadge(false, 0);
+      }
+    }
+  }
+
+  // 3. Periodic Header & BLE Status Check (Every 4 seconds, NO full-screen wipe!)
+  static bool lastBleState = false;
+  static unsigned long lastHeaderCheck = 0;
+  if (isBleConnected != lastBleState || (now - lastHeaderCheck > 4000)) {
+    bool bleChanged = (isBleConnected != lastBleState);
+    lastBleState = isBleConnected;
+    lastHeaderCheck = now;
+
+    if (currentState == STATE_HOME) {
+      drawHeader("COCA-COLA SHAKE");
+      if (bleChanged) {
+        // Redraw only connection pill status cleanly
+        int cardW = SCR_W - (MARGIN_X * 2);
+        int cardY = 44;
+        int pillY = cardY + 58;
+        uint16_t pillBg = isBleConnected ? 0x03E0 : 0x2124;
+        uint16_t pillText = isBleConnected ? COLOR_GREEN : COLOR_TEXT_DIM;
+        const char* statusStr = isBleConnected ? "BLE CONNECTED" : "SEARCHING GAME...";
+        gfx->fillRoundRect(MARGIN_X + 24, pillY, cardW - 48, 20, 10, pillBg);
+        gfx->setTextSize(1);
+        gfx->setTextColor(pillText);
+        gfx->setCursor(MARGIN_X + (cardW - strlen(statusStr) * 6) / 2, pillY + 6);
+        gfx->print(statusStr);
+      }
+    } else if (currentState == STATE_SETTINGS) {
+      char titleBuf[32];
+      snprintf(titleBuf, sizeof(titleBuf), "SETTINGS (%d/%d)", currentSettingsPage + 1, TOTAL_SETTINGS_PAGES);
+      drawHeader(titleBuf);
+    }
+  }
+
+  // 4. Touch Input & Dragging Management
+  int32_t tx = 0, ty = 0;
+  if (readTouchPoint(&tx, &ty)) {
+    lastTouchSeenTime = now;
+    currentTouchX = tx;
+    currentTouchY = ty;
+
+    if (!isTouching) {
+      isTouching = true;
+      touchDownX = tx;
+      touchDownY = ty;
+      onTouchPressed(tx, ty);
+    } else {
+      // Continuous dragging while finger is held down
+      if (currentState == STATE_SETTINGS) {
+        if (currentSettingsPage == 2 && isBrightnessDragging) {
+          handleBrightnessDrag(tx);
+        } else if (currentSettingsPage == 3) {
+          if (isForceDragging) {
+            handleForceDrag(tx);
+          } else if (isSpeedDragging) {
+            handleSpeedDrag(tx);
+          }
+        }
+      }
+    }
+  } else {
+    if (isTouching && (now - lastTouchSeenTime > 75)) {
+      int32_t releaseX = touchDownX;
+      int32_t releaseY = touchDownY;
+      isTouching = false;
+      isBrightnessDragging = false;
+      isForceDragging = false;
+      isSpeedDragging = false;
+      onTouchReleased(releaseX, releaseY);
+    }
+  }
+}

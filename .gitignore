@@ -1,0 +1,25 @@
+# Python & Virtual Environments
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs & Session Data
+logs/*.csv
+!logs/.gitkeep
+
+# OS & Editor Files
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# Build artifacts
+build/
+*.bin
+*.elf
+*.hex
