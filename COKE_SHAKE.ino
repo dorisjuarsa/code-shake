@@ -1927,19 +1927,30 @@ void loop() {
   // ============================================================
   // AUTO-SLEEP & GAMEPLAY TIMEOUT LOGIC
   // ============================================================
-  // 1. Jika terkoneksi ke Web Game (isBleConnected == true):
-  //    - Jangan pernah matikan botol saat game sedang terhubung!
-  //    - Batas keamanan: hanya jika botol ditinggal idle total 3 menit tanpa goncangan,
-  //      maka putus koneksi dan deep sleep.
-  if (isBleConnected) {
-    if (now - lastValidShakeTime >= 180000UL) {
-      Serial.println("[PWR] 3 Menit idle saat terkoneksi -> Putus & Deep Sleep");
+  // 1. Jika mode ULTRA SLEEP (sleepProfile == 1):
+  //    - Mengikuti sleepTimerSeconds dari Menu 5/6 (misal 10s, 60s, 120s, dll)
+  //    - Ketika layar OFF dan idle melebihi batas waktu tersebut, langsung masuk
+  //      ke TRUE DEEP SLEEP (~70 uA) meskipun BLE sedang terhubung.
+  if (sleepProfile == 1 && sleepTimerSeconds > 0) {
+    unsigned long timeoutMs = (unsigned long)sleepTimerSeconds * 1000UL;
+    unsigned long idleRef = max(lastValidShakeTime, lastActivityTime);
+    if (!isScreenOn && (now - idleRef >= timeoutMs)) {
+      isBottleActive = false;
+      Serial.println("[PWR] Ultra Sleep: Layar OFF & Idle Timeout tercapai -> Putus & Deep Sleep");
       executeDeepSleep();
     }
   }
-  // 2. Jika TIDAK terkoneksi (!isBleConnected) dan Layar sedang OFF:
-  //    - Jika botol dalam mode Ultra Sleep, tunggu koneksi/aktivitas selama 30 detik.
-  //    - Jika dalam 30 detik tidak ada aktivitas atau koneksi baru, masuk True Deep Sleep (~70 uA).
+  // 2. Jika mode FAST STANDBY (sleepProfile == 0):
+  //    - Layar mati, tapi radio BLE tetap aktif untuk respons seketika.
+  //    - Proteksi keamanan: jika terkoneksi tapi ditinggal 5 menit tanpa goncangan, baru deep sleep.
+  else if (sleepProfile == 0 && isBleConnected) {
+    if (now - lastValidShakeTime >= 300000UL) {
+      Serial.println("[PWR] Fast Standby: 5 Menit idle saat terkoneksi -> Putus & Deep Sleep");
+      executeDeepSleep();
+    }
+  }
+  // 3. Jika botol tidak terkoneksi dan layar sudah OFF:
+  //    - Berikan batas toleransi 30 detik sebelum deep sleep jika Ultra Sleep aktif
   else if (!isScreenOn && sleepProfile == 1) {
     unsigned long idleRef = max(lastValidShakeTime, lastActivityTime);
     if (now - idleRef >= 30000UL) {
@@ -1985,7 +1996,7 @@ void loop() {
       unsigned long countdownElapsed = now - sleepCountdownStartTime;
       if (countdownElapsed >= 5000UL) {
         // 5 seconds elapsed without cancel -> Sleep!
-        if (sleepProfile == 1 && !isBleConnected) {
+        if (sleepProfile == 1) {
           executeDeepSleep();
         } else {
           turnScreenOff();
