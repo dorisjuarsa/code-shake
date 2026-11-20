@@ -2,13 +2,21 @@
 .venv/
 venv/
 env/
-__pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 
 # Logs & Session Data
 logs/*.csv
+game/logs/*.csv
+!game/logs/.gitkeep
 !logs/.gitkeep
+
+# 3D CAD & Local Assets
+3D_MODEL/
+*.FCBak
+*.FCStd1
+*.FCStd2
 
 # OS & Editor Files
 .DS_Store

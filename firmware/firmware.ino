@@ -1,9 +1,8 @@
-/**
+/*
  * COKE_SHAKE.ino
  *
  * Interactive Coca-Cola Bottle Controller
- * Hardware: Waveshare ESP32-S3-Touch-LCD-1.83 (ST7789P + CST816T + QMI8658 +
- * AXP2101 + ES8311)
+ * Hardware: Waveshare ESP32-S3-Touch-LCD-1.83 (ST7789P + CST816T + QMI8658 + AXP2101 + ES8311)
  *
  * BLE Game Protocol:
  * - Device Names: COCA-COLA-BOTTLE-01 / COCA-COLA-BOTTLE-02
@@ -14,19 +13,15 @@
  * Features:
  * 1. Omni-directional Peak-to-Peak Bipolar Shake Filter (Zero false triggers).
  * 2. Tuned for natural 30cm human hand shaking (Sensitivity 0.10g - 2.00g).
- * 3. Dual Sliders: FORCE (0.10g - 2.00g) & SPEED (Ultra-Fast 5ms - Normal
- * 100ms).
- * 4. Inverted-contrast slider text rendered directly inside bars to maximize
- * screen area.
- * 5. Nokia Pager / Smartwatch Carousel Settings (5-page carousel with < PREV &
- * NEXT >).
+ * 3. Dual Sliders: FORCE (0.10g - 2.00g) & SPEED (Ultra-Fast 5ms - Normal 100ms).
+ * 4. Inverted-contrast slider text rendered directly inside bars to maximize screen area.
+ * 5. Nokia Pager / Smartwatch Carousel Settings (5-page carousel with < PREV & NEXT >).
  * 6. Interactive Touch Drag Slider for Brightness (PWM 5-255).
  * 7. Mini Oscilloscope with 100% full-width wave & dynamic curve amplification.
  * 8. Safe curved-bezel header layout with Vector Battery & Vector BLE icons.
  * 9. Zero-flicker Home screen (no periodic full-screen wipe).
  * 10. Auto-Sleep timer selector (1 to 5 min / Never).
- * 11. RTC RAM Sequence Counter (#1, #2, #3...) immune to Flash wear & sleep
- * reset.
+ * 11. RTC RAM Sequence Counter (#1, #2, #3...) immune to Flash wear & sleep reset.
  */
 
 #include "Arduino_DriveBus_Library.h"
@@ -207,6 +202,8 @@ void handleForceDrag(int32_t curX);
 void handleSpeedDrag(int32_t curX);
 void applyBrightnessPWM(int pwm);
 int getBatteryLevelPercentage();
+void drawVectorBattery(int x, int y, bool forceOutline = true);
+void updateBatteryIndicatorRealtime(bool force = false);
 void sendShakeData(int intensity);
 void executeDeepSleep();
 void turnScreenOff();
@@ -244,10 +241,12 @@ void drawCenteredText(const char *text, int y, uint16_t color,
 // ==========================================
 int getBatteryLevelPercentage() {
   int batt = pmu.getBatteryPercent();
-  if (batt <= 0) {
+  if (batt <= 0 || batt > 100) {
     uint16_t vbat = pmu.getBattVoltage();
     if (vbat >= 3300) {
       batt = constrain((int)((vbat - 3300) * 100 / (4180 - 3300)), 1, 100);
+    } else if (vbat > 2000) {
+      batt = 1;
     } else {
       batt = 100;
     }
@@ -258,7 +257,8 @@ int getBatteryLevelPercentage() {
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo) override {
     isBleConnected = true;
-    lastValidShakeTime = millis(); // Refresh timer agar game mendapat batas 3 menit penuh sejak connect
+    lastValidShakeTime = millis(); // Refresh timer agar game mendapat batas 3
+                                   // menit penuh sejak connect
     Serial.println("[BLE] >>> GAME CONNECTED! <<<");
     // NOTE: Tidak kirim paket dummy saat koneksi.
     // Data baterai akan ikut terkirim otomatis pada shake berikutnya
@@ -268,17 +268,14 @@ class ServerCallbacks : public NimBLEServerCallbacks {
   void onDisconnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo,
                     int reason) override {
     isBleConnected = false;
-    lastValidShakeTime = millis(); // Berikan 30 detik untuk auto-reconnect
-    Serial.println("[BLE] --- DISCONNECTED ---");
-    // Restart advertising if screen is ON, profile is Fast Standby, or gameplay
-    // is active!
-    if (isScreenOn || sleepProfile == 0 || isBottleActive) {
-      NimBLEDevice::startAdvertising();
-      Serial.println("[BLE] Advertising Restarted");
-    } else {
-      Serial.println(
-          "[BLE] Ultra Sleep Active: Advertising kept OFF for Deep Sleep");
-    }
+    lastActivityTime = millis();
+    lastValidShakeTime = millis();
+    Serial.printf("[BLE] --- DISCONNECTED (Reason: 0x%02X) ---\n", reason);
+
+    // Selalu nyalakan kembali advertising agar auto-reconnect bekerja seketika
+    // saat botol kembali dalam jangkauan sinyal!
+    NimBLEDevice::startAdvertising();
+    Serial.println("[BLE] Advertising Restarted for Auto-Reconnect");
   }
 };
 
@@ -429,8 +426,8 @@ void turnScreenOff() {
   // 2. Put ST7789 display controller into deep sleep
   gfx->displayOff();
 
-  Serial.println(
-      "[PWR] >>> Screen OFF: Display & Backlight 0 mA (BLE remains active) <<<");
+  Serial.println("[PWR] >>> Screen OFF: Display & Backlight 0 mA (BLE remains "
+                 "active) <<<");
 
   resetInactivityTimer();
 }
@@ -477,18 +474,21 @@ void turnScreenOn() {
 
 void executeSleepNow() {
   Serial.println("[PWR] >>> Executing User SLEEP NOW <<<");
-  gfx->fillScreen(COLOR_BG);
-  drawCenteredText("GOING TO SLEEP...", 120, COLOR_WHITE, 2);
-  const char *profTxt =
-      (sleepProfile == 1) ? "Deep Sleep (~70 uA)" : "Fast Standby (~14 mA)";
-  drawCenteredText(profTxt, 150, (sleepProfile == 1) ? COLOR_GREEN : COLOR_CYAN,
-                   1);
-  drawCenteredText("Wake: Shake or Button", 175, COLOR_YELLOW, 1);
-  delay(400);
+  if (isScreenOn) {
+    gfx->fillScreen(COLOR_BG);
+    drawCenteredText("GOING TO SLEEP...", 120, COLOR_WHITE, 2);
+    const char *profTxt =
+        (sleepProfile == 1) ? "Deep Sleep (~70 uA)" : "Fast Standby (~14 mA)";
+    drawCenteredText(profTxt, 150,
+                     (sleepProfile == 1) ? COLOR_GREEN : COLOR_CYAN, 1);
+    drawCenteredText("Wake: Shake or Button", 175, COLOR_YELLOW, 1);
+    delay(400);
+  }
 
   if (sleepProfile == 1) {
     executeDeepSleep();
   } else {
+    disconnectBleClients();
     turnScreenOff();
   }
 }
@@ -654,35 +654,89 @@ void saveSettings() {
 // ==========================================
 // VECTOR GRAPHICS & HEADER HELPERS
 // ==========================================
-void drawVectorBattery(int x, int y) {
+void drawVectorBattery(int x, int y, bool forceOutline) {
   int percent = getBatteryLevelPercentage();
   bool chg = pmu.isCharging();
   bool vbus = pmu.isVbusIn();
+  bool isFull =
+      (vbus && (!chg || percent >= 100 ||
+                pmu.getChargerStatus() == XPOWERS_AXP2101_CHG_DONE_STATE));
 
-  // Battery Body Outline (W: 24, H: 12)
-  gfx->drawRoundRect(x, y, 24, 12, 2, COLOR_CARD_BRD);
-  // Terminal Nub
-  gfx->fillRect(x + 24, y + 3, 2, 6, COLOR_CARD_BRD);
+  if (forceOutline) {
+    // Battery Body Outline (W: 24, H: 12)
+    gfx->drawRoundRect(x, y, 24, 12, 2, COLOR_CARD_BRD);
+    // Terminal Nub
+    gfx->fillRect(x + 24, y + 3, 2, 6, COLOR_CARD_BRD);
+  }
 
   // Fill Bar
   int fillW = constrain((percent * 20) / 100, 1, 20);
-  uint16_t barColor = (percent < 20) ? COLOR_COKE_RED
-                                     : (chg || vbus ? COLOR_CYAN : COLOR_GREEN);
+  uint16_t barColor;
+  char battStr[16];
+
+  if (vbus) {
+    if (isFull) {
+      barColor = COLOR_GREEN;
+      snprintf(battStr, sizeof(battStr), "FULL %d%%", percent);
+    } else {
+      barColor = COLOR_CYAN;
+      snprintf(battStr, sizeof(battStr), "CHG %d%%", percent);
+    }
+  } else {
+    barColor = (percent < 20) ? COLOR_COKE_RED : COLOR_GREEN;
+    snprintf(battStr, sizeof(battStr), "%d%%", percent);
+  }
+
+  // Draw inner fill bar (clears unfilled space inside battery icon)
   gfx->fillRect(x + 2, y + 2, fillW, 8, barColor);
-  gfx->fillRect(x + 2 + fillW, y + 2, 20 - fillW, 8, COLOR_BG);
+  if (fillW < 20) {
+    gfx->fillRect(x + 2 + fillW, y + 2, 20 - fillW, 8, COLOR_BG);
+  }
+
+  // Clear text label background first to avoid ghost characters (e.g. switching
+  // from "FULL 100%" to "85%")
+  gfx->fillRect(x + 28, y, 70, 13, COLOR_BG);
 
   // Text label
   gfx->setTextSize(1);
   gfx->setTextColor(barColor);
   gfx->setCursor(x + 30, y + 3);
-  if (vbus) {
-    gfx->print(chg ? "CHG" : "USB");
-  } else {
-    gfx->printf("%d%%", percent);
+  gfx->print(battStr);
+}
+
+void updateBatteryIndicatorRealtime(bool force) {
+  if (!isScreenOn || isCountingDownSleep || isWakeupSplashActive) {
+    return;
+  }
+
+  static int lastPercent = -1;
+  static bool lastChg = false;
+  static bool lastVbus = false;
+  static unsigned long lastBatteryCheck = 0;
+
+  unsigned long now = millis();
+  if (!force && (now - lastBatteryCheck < 500)) {
+    return; // Cek status baterai setiap 500ms
+  }
+  lastBatteryCheck = now;
+
+  int percent = getBatteryLevelPercentage();
+  bool chg = pmu.isCharging();
+  bool vbus = pmu.isVbusIn();
+
+  if (force || percent != lastPercent || chg != lastChg || vbus != lastVbus) {
+    lastPercent = percent;
+    lastChg = chg;
+    lastVbus = vbus;
+    // Partial update: hanya redraw bar dan teks tanpa menghapus seluruh header
+    drawVectorBattery(HEADER_SAFE_X, 7, force);
   }
 }
 
 void drawVectorBle(int x, int y) {
+  // Clear BLE area first for clean partial redraw
+  gfx->fillRect(x - 46, y, 58, 14, COLOR_BG);
+
   uint16_t col = isBleConnected ? COLOR_CYAN : COLOR_CARD_BRD;
   // Center stem
   gfx->drawFastVLine(x + 4, y, 13, col);
@@ -696,7 +750,7 @@ void drawVectorBle(int x, int y) {
   gfx->setTextSize(1);
   gfx->setTextColor(isBleConnected ? COLOR_CYAN : COLOR_TEXT_DIM);
   gfx->setCursor(x - 38, y + 3);
-  gfx->print(isBleConnected ? "READY" : "WAIT ");
+  gfx->print(isBleConnected ? "READY" : "ADVRT");
 }
 
 void drawHeader(const char *title) {
@@ -704,7 +758,7 @@ void drawHeader(const char *title) {
   gfx->fillRect(0, 0, SCR_W, 44, COLOR_BG);
 
   // Vector Battery on Left (Safe X >= 22)
-  drawVectorBattery(HEADER_SAFE_X, 7);
+  drawVectorBattery(HEADER_SAFE_X, 7, true);
 
   // Vector BLE on Right
   drawVectorBle(SCR_W - HEADER_SAFE_X - 10, 7);
@@ -1925,46 +1979,13 @@ void loop() {
   now = millis();
 
   // ============================================================
-  // AUTO-SLEEP & GAMEPLAY TIMEOUT LOGIC
+  // AUTO-SLEEP & INACTIVITY MANAGEMENT
   // ============================================================
-  // 1. Jika mode ULTRA SLEEP (sleepProfile == 1):
-  //    - Mengikuti sleepTimerSeconds dari Menu 5/6 (misal 10s, 60s, 120s, dll)
-  //    - Ketika layar OFF dan idle melebihi batas waktu tersebut, langsung masuk
-  //      ke TRUE DEEP SLEEP (~70 uA) meskipun BLE sedang terhubung.
-  if (sleepProfile == 1 && sleepTimerSeconds > 0) {
-    unsigned long timeoutMs = (unsigned long)sleepTimerSeconds * 1000UL;
-    unsigned long idleRef = max(lastValidShakeTime, lastActivityTime);
-    if (!isScreenOn && (now - idleRef >= timeoutMs)) {
-      isBottleActive = false;
-      Serial.println("[PWR] Ultra Sleep: Layar OFF & Idle Timeout tercapai -> Putus & Deep Sleep");
-      executeDeepSleep();
-    }
-  }
-  // 2. Jika mode FAST STANDBY (sleepProfile == 0):
-  //    - Layar mati, tapi radio BLE tetap aktif untuk respons seketika.
-  //    - Proteksi keamanan: jika terkoneksi tapi ditinggal 5 menit tanpa goncangan, baru deep sleep.
-  else if (sleepProfile == 0 && isBleConnected) {
-    if (now - lastValidShakeTime >= 300000UL) {
-      Serial.println("[PWR] Fast Standby: 5 Menit idle saat terkoneksi -> Putus & Deep Sleep");
-      executeDeepSleep();
-    }
-  }
-  // 3. Jika botol tidak terkoneksi dan layar sudah OFF:
-  //    - Berikan batas toleransi 30 detik sebelum deep sleep jika Ultra Sleep aktif
-  else if (!isScreenOn && sleepProfile == 1) {
-    unsigned long idleRef = max(lastValidShakeTime, lastActivityTime);
-    if (now - idleRef >= 30000UL) {
-      isBottleActive = false;
-      Serial.println("[PWR] Layar OFF & Idle 30s -> Masuk TRUE DEEP SLEEP");
-      executeDeepSleep();
-    }
-  }
-
   // Handle Temporary Wakeup Splash Timeout (Screen dims back to save battery
   // during gameplay)
   if (isWakeupSplashActive && (now >= wakeupSplashEndTime)) {
-    Serial.println("[WAKE] Splash 2s selesai -> Matikan layar (tetap armed "
-                   "untuk gameplay)");
+    Serial.println(
+        "[WAKE] Splash 2s selesai -> Layar mati (tetap armed untuk gameplay)");
     isScreenOn = false;
     isWakeupSplashActive = false;
     countdownFrameDrawn = false;
@@ -1974,40 +1995,89 @@ void loop() {
     gfx->displayOff();
     isBottleActive = true;
     lastValidShakeTime = millis();
+    lastActivityTime = millis();
     now = millis();
   }
 
-  // 2. Auto-Sleep Countdown & Inactivity Monitor (Only when Screen is ON &
-  // Timer Enabled & NOT Wakeup Splash)
-  if (isScreenOn && !isWakeupSplashActive && sleepTimerSeconds > 0) {
+  // PENTING: Jika pengguna memilih ALWAYS ON (sleepTimerSeconds == 0),
+  // JANGAN PERNAH tidur otomatis! Patuhi pilihan pengguna 100%.
+  if (sleepTimerSeconds > 0) {
     unsigned long timeoutMs = (unsigned long)sleepTimerSeconds * 1000UL;
-    unsigned long idleTime =
-        (now >= lastActivityTime) ? (now - lastActivityTime) : 0;
+    unsigned long idleRef = max(lastValidShakeTime, lastActivityTime);
+    unsigned long idleDuration = (now >= idleRef) ? (now - idleRef) : 0;
 
-    if (idleTime >= (timeoutMs - 5000UL)) {
-      if (!isCountingDownSleep) {
-        isCountingDownSleep = true;
-        countdownFrameDrawn = false;
-        sleepCountdownStartTime = now;
-        lastCountdownSecondDrawn = -1;
-        lastCountdownBarWidth = -1;
+    // KASUS 1: SEDANG TERHUBUNG KE GAME (isBleConnected == true)
+    // Jika botol terhubung tapi ditinggal idle tanpa goncangan melebihi
+    // sleepTimerSeconds: Lakukan pemutusan koneksi secara bersih (Graceful
+    // Disconnect) lalu masuk mode sleep
+    if (isBleConnected) {
+      if (idleDuration >= timeoutMs) {
+        Serial.println("[PWR] Idle melebihi timer saat terkoneksi -> Graceful "
+                       "Disconnect & Sleep");
+        executeSleepNow();
       }
-
-      unsigned long countdownElapsed = now - sleepCountdownStartTime;
-      if (countdownElapsed >= 5000UL) {
-        // 5 seconds elapsed without cancel -> Sleep!
-        if (sleepProfile == 1) {
-          executeDeepSleep();
-        } else {
-          turnScreenOff();
+    }
+    // KASUS 2: TIDAK TERHUBUNG KE GAME (isBleConnected == false)
+    // Mengikuti waktu sleepTimerSeconds yang dipilih di menu (10s, 60s, 120s,
+    // 180s, 300s):
+    else {
+      // A. Jika Layar sedang MATI (Screen OFF):
+      if (!isScreenOn) {
+        if (idleDuration >= timeoutMs) {
+          isBottleActive = false;
+          if (sleepProfile == 1) {
+            Serial.println(
+                "[PWR] Disconnected & Idle Timeout -> Masuk TRUE DEEP SLEEP");
+            executeDeepSleep();
+          }
+          // Jika Fast Standby (sleepProfile == 0), radio tetap aktif stand-by
+          // mencari game (~14mA)
         }
-      } else {
-        int remSec = 5 - (int)(countdownElapsed / 1000UL);
-        remSec = constrain(remSec, 1, 5);
-        int pctRemaining =
-            (int)(((5000UL - countdownElapsed) * 100UL) / 5000UL);
-        renderSleepCountdownScreen(remSec, pctRemaining);
       }
+      // B. Jika Layar sedang NYALA (Screen ON):
+      // Munculkan countdown peringatan 5 detik sebelum layar mati / tidur
+      else if (!isWakeupSplashActive) {
+        if (idleDuration >= (timeoutMs - 5000UL)) {
+          if (!isCountingDownSleep) {
+            isCountingDownSleep = true;
+            countdownFrameDrawn = false;
+            sleepCountdownStartTime = now;
+            lastCountdownSecondDrawn = -1;
+            lastCountdownBarWidth = -1;
+          }
+
+          unsigned long countdownElapsed = now - sleepCountdownStartTime;
+          if (countdownElapsed >= 5000UL) {
+            // 5 detik countdown selesai tanpa disentuh -> Masuk sleep sesuai
+            // profile
+            if (sleepProfile == 1) {
+              executeDeepSleep();
+            } else {
+              turnScreenOff();
+            }
+          } else {
+            int remSec = 5 - (int)(countdownElapsed / 1000UL);
+            remSec = constrain(remSec, 1, 5);
+            int pctRemaining =
+                (int)(((5000UL - countdownElapsed) * 100UL) / 5000UL);
+            renderSleepCountdownScreen(remSec, pctRemaining);
+          }
+        }
+      }
+    }
+  }
+
+  // BLE Auto-Advertising Watchdog:
+  // Jika tidak terkoneksi, pastikan radio BLE tetap memancarkan iklan
+  // (advertising) agar laptop bisa mendeteksi & menyambung otomatis seketika
+  // saat botol mendekat. Pengecekan hanya setiap 1000ms (1 detik) sehingga 0%
+  // beban CPU / hemat daya.
+  static unsigned long lastAdvWatchdogTime = 0;
+  if (!isBleConnected && (now - lastAdvWatchdogTime >= 1000UL)) {
+    lastAdvWatchdogTime = now;
+    if (!NimBLEDevice::getAdvertising()->isAdvertising()) {
+      NimBLEDevice::startAdvertising();
+      Serial.println("[BLE] Watchdog: Advertising dipastikan AKTIF");
     }
   }
 
@@ -2186,39 +2256,33 @@ void loop() {
     }
   }
 
-  // 4. Periodic Header & BLE Status Check (Every 4 seconds, NO full-screen
-  // wipe!)
-  static bool lastBleState = false;
-  static unsigned long lastHeaderCheck = 0;
-  if (isScreenOn && !isCountingDownSleep && !isWakeupSplashActive &&
-      (isBleConnected != lastBleState || (now - lastHeaderCheck > 4000))) {
-    bool bleChanged = (isBleConnected != lastBleState);
-    lastBleState = isBleConnected;
-    lastHeaderCheck = now;
+  // 4. Real-time Battery Indicator Update (500ms check, partial redraw,
+  // zero-flicker)
+  updateBatteryIndicatorRealtime(false);
 
+  // Periodic BLE Status Check (Instant partial update when status changes)
+  static bool lastBleState = false;
+  if (isScreenOn && !isCountingDownSleep && !isWakeupSplashActive &&
+      (isBleConnected != lastBleState)) {
+    lastBleState = isBleConnected;
+
+    // Partial update: Redraw BLE vector icon cleanly
+    drawVectorBle(SCR_W - HEADER_SAFE_X - 10, 7);
+
+    // If on HOME screen, cleanly update connection pill
     if (currentState == STATE_HOME) {
-      drawHeader("COCA-COLA SHAKE");
-      if (bleChanged) {
-        // Redraw only connection pill status cleanly
-        int cardW = SCR_W - (MARGIN_X * 2);
-        int cardY = 44;
-        int pillY = cardY + 58;
-        uint16_t pillBg = isBleConnected ? 0x03E0 : 0x2124;
-        uint16_t pillText = isBleConnected ? COLOR_GREEN : COLOR_TEXT_DIM;
-        const char *statusStr =
-            isBleConnected ? "BLE CONNECTED" : "SEARCHING GAME...";
-        gfx->fillRoundRect(MARGIN_X + 24, pillY, cardW - 48, 20, 10, pillBg);
-        gfx->setTextSize(1);
-        gfx->setTextColor(pillText);
-        gfx->setCursor(MARGIN_X + (cardW - strlen(statusStr) * 6) / 2,
-                       pillY + 6);
-        gfx->print(statusStr);
-      }
-    } else if (currentState == STATE_SETTINGS) {
-      char titleBuf[32];
-      snprintf(titleBuf, sizeof(titleBuf), "SETTINGS (%d/%d)",
-               currentSettingsPage + 1, TOTAL_SETTINGS_PAGES);
-      drawHeader(titleBuf);
+      int cardW = SCR_W - (MARGIN_X * 2);
+      int cardY = 44;
+      int pillY = cardY + 58;
+      uint16_t pillBg = isBleConnected ? 0x03E0 : 0x2124;
+      uint16_t pillText = isBleConnected ? COLOR_GREEN : COLOR_TEXT_DIM;
+      const char *statusStr =
+          isBleConnected ? "BLE CONNECTED" : "SEARCHING GAME...";
+      gfx->fillRoundRect(MARGIN_X + 24, pillY, cardW - 48, 20, 10, pillBg);
+      gfx->setTextSize(1);
+      gfx->setTextColor(pillText);
+      gfx->setCursor(MARGIN_X + (cardW - strlen(statusStr) * 6) / 2, pillY + 6);
+      gfx->print(statusStr);
     }
   }
 
