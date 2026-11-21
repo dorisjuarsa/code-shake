@@ -113,8 +113,8 @@ enum ScreenState { STATE_HOME, STATE_SETTINGS, STATE_SET_COUNTER };
 
 ScreenState currentState = STATE_HOME;
 int currentSettingsPage = 0; // 0: Device ID, 1: Counter ID, 2: Brightness, 3:
-                             // Shake Diag, 4: Auto Sleep, 5: Power Control
-const int TOTAL_SETTINGS_PAGES = 6;
+                             // Shake Diag, 4: Auto Sleep, 5: Power Control, 6: Touch Canvas
+const int TOTAL_SETTINGS_PAGES = 7;
 
 // Settings (Saved in NVS)
 int bottleNumber = DEFAULT_BOTTLE_ID; // 1 or 2
@@ -179,6 +179,11 @@ bool isBrightnessDragging = false;
 bool isForceDragging = false;
 bool isSpeedDragging = false;
 
+// Touch Diagnostic Canvas Tracking (Page 7/7)
+int32_t lastTouchPaintX = -1;
+int32_t lastTouchPaintY = -1;
+uint32_t touchPaintCount = 0;
+
 // Temporary buffer for Numpad
 String tempInputNumber = "";
 
@@ -200,6 +205,10 @@ void updateBrightnessSliderUI();
 void updateDualSlidersUI();
 void handleForceDrag(int32_t curX);
 void handleSpeedDrag(int32_t curX);
+void renderTouchCanvasPage();
+void handleTouchPaintPress(int32_t tx, int32_t ty);
+void handleTouchPaintDrag(int32_t tx, int32_t ty);
+void handleTouchPaintRelease();
 void applyBrightnessPWM(int pwm);
 int getBatteryLevelPercentage();
 void drawVectorBattery(int x, int y, bool forceOutline = true);
@@ -1084,6 +1093,11 @@ void renderSettingsPageContent() {
                      1);
     break;
   }
+
+  case 6: { // 7. TOUCH DIAGNOSTIC CANVAS
+    renderTouchCanvasPage();
+    break;
+  }
   }
 }
 
@@ -1247,6 +1261,139 @@ void updateDiagStatusBadge(bool triggered, int intensity) {
   } else {
     drawCenteredText("Slide bars to calibrate", statusY, COLOR_TEXT_DIM, 1);
   }
+}
+
+// ==========================================
+// TOUCH DIAGNOSTIC CANVAS (PAGE 7/7)
+// ==========================================
+void renderTouchCanvasPage() {
+  int contentY = 44;
+
+  // Top toolbar: [ CLEAR ] button & Live Coordinate/Count Badge
+  TouchButton btnClear = {10, (int16_t)(contentY + 2), 56, 20, "CLEAR", COLOR_COKE_RED, COLOR_WHITE};
+  drawButton(btnClear);
+
+  gfx->fillRoundRect(70, contentY + 2, SCR_W - 70 - 10, 20, 4, COLOR_CARD_BG);
+  gfx->drawRoundRect(70, contentY + 2, SCR_W - 70 - 10, 20, 4, COLOR_CARD_BRD);
+  gfx->setTextColor(COLOR_YELLOW);
+  gfx->setTextSize(1);
+  gfx->setCursor(76, contentY + 8);
+  if (touchPaintCount == 0) {
+    gfx->print("TOUCH & DRAG TEST");
+  } else {
+    gfx->printf("X:%-3d Y:%-3d #%-4u", (lastTouchPaintX >= 0) ? lastTouchPaintX : 0,
+               (lastTouchPaintY >= 0) ? lastTouchPaintY : 0, touchPaintCount);
+  }
+
+  // Wide Canvas Area: X = 6..234 (W = 228), Y = 68..220 (H = 152)
+  int cvX = 6;
+  int cvY = 68;
+  int cvW = SCR_W - 12;
+  int cvH = 152;
+
+  gfx->fillRect(cvX, cvY, cvW, cvH, 0x0000);
+  gfx->drawRect(cvX, cvY, cvW, cvH, COLOR_CARD_BRD);
+
+  // Subtle grid lines (28px vertical, 25px horizontal)
+  for (int gx = cvX + 28; gx < cvX + cvW; gx += 28) {
+    gfx->drawFastVLine(gx, cvY + 1, cvH - 2, 0x18C3);
+  }
+  for (int gy = cvY + 25; gy < cvY + cvH; gy += 25) {
+    gfx->drawFastHLine(cvX + 1, gy, cvW - 2, 0x18C3);
+  }
+
+  // Instructions if empty
+  if (touchPaintCount == 0) {
+    drawCenteredText("SCRATCH / DRAW HERE", cvY + 56, 0x39E7, 1);
+    drawCenteredText("Visual Dead Zone Check", cvY + 74, 0x2124, 1);
+  }
+}
+
+void handleTouchPaintPress(int32_t tx, int32_t ty) {
+  int contentY = 44;
+
+  // Clear button check
+  if (tx >= 10 && tx <= 66 && ty >= (contentY + 2) && ty <= (contentY + 22)) {
+    touchPaintCount = 0;
+    lastTouchPaintX = -1;
+    lastTouchPaintY = -1;
+    renderTouchCanvasPage();
+    return;
+  }
+
+  // Update coordinate badge for ANY touch on page 7 (helps detect edge/bezel response!)
+  gfx->fillRect(72, contentY + 4, SCR_W - 72 - 12, 16, COLOR_CARD_BG);
+  gfx->setTextColor(COLOR_GREEN);
+  gfx->setTextSize(1);
+  gfx->setCursor(76, contentY + 8);
+  gfx->printf("X:%-3d Y:%-3d #%-4u", tx, ty, touchPaintCount + 1);
+
+  // Drawing inside canvas
+  if (ty >= 68 && ty < 220) {
+    if (touchPaintCount == 0) {
+      // Clear hint text on first touch
+      int cvX = 6;
+      int cvY = 68;
+      int cvW = SCR_W - 12;
+      int cvH = 152;
+      gfx->fillRect(cvX + 1, cvY + 1, cvW - 2, cvH - 2, 0x0000);
+      for (int gx = cvX + 28; gx < cvX + cvW; gx += 28) {
+        gfx->drawFastVLine(gx, cvY + 1, cvH - 2, 0x18C3);
+      }
+      for (int gy = cvY + 25; gy < cvY + cvH; gy += 25) {
+        gfx->drawFastHLine(cvX + 1, gy, cvW - 2, 0x18C3);
+      }
+    }
+
+    touchPaintCount++;
+    lastTouchPaintX = tx;
+    lastTouchPaintY = ty;
+    gfx->fillCircle(tx, ty, 3, COLOR_GREEN);
+    gfx->drawPixel(tx, ty, COLOR_WHITE);
+  }
+}
+
+void handleTouchPaintDrag(int32_t tx, int32_t ty) {
+  int contentY = 44;
+
+  // Update live coordinate badge on every drag move
+  static unsigned long lastBadgeUpdate = 0;
+  if (millis() - lastBadgeUpdate > 50) {
+    lastBadgeUpdate = millis();
+    gfx->fillRect(72, contentY + 4, SCR_W - 72 - 12, 16, COLOR_CARD_BG);
+    gfx->setTextColor(COLOR_GREEN);
+    gfx->setTextSize(1);
+    gfx->setCursor(76, contentY + 8);
+    gfx->printf("X:%-3d Y:%-3d #%-4u", tx, ty, touchPaintCount);
+  }
+
+  // Draw in canvas
+  if (ty >= 68 && ty < 220) {
+    touchPaintCount++;
+    if (lastTouchPaintX >= 0 && lastTouchPaintY >= 0) {
+      gfx->drawLine(lastTouchPaintX, lastTouchPaintY, tx, ty, COLOR_GREEN);
+      gfx->fillCircle(tx, ty, 3, COLOR_GREEN);
+      gfx->drawPixel(tx, ty, COLOR_WHITE);
+    } else {
+      gfx->fillCircle(tx, ty, 3, COLOR_GREEN);
+      gfx->drawPixel(tx, ty, COLOR_WHITE);
+    }
+    lastTouchPaintX = tx;
+    lastTouchPaintY = ty;
+  }
+}
+
+void handleTouchPaintRelease() {
+  lastTouchPaintX = -1;
+  lastTouchPaintY = -1;
+
+  int contentY = 44;
+  gfx->fillRect(72, contentY + 4, SCR_W - 72 - 12, 16, COLOR_CARD_BG);
+  gfx->setTextColor(COLOR_CYAN);
+  gfx->setTextSize(1);
+  gfx->setCursor(76, contentY + 8);
+  gfx->printf("UP X:%-3d Y:%-3d #%-4u", (currentTouchX >= 0) ? currentTouchX : 0,
+             (currentTouchY >= 0) ? currentTouchY : 0, touchPaintCount);
 }
 
 // ==========================================
@@ -1484,6 +1631,10 @@ void onTouchPressed(int32_t tx, int32_t ty) {
         handleSpeedDrag(tx);
       }
     }
+    // Page 6 (Touch Diagnostic Canvas Press)
+    else if (currentSettingsPage == 6) {
+      handleTouchPaintPress(tx, ty);
+    }
   } else if (currentState == STATE_SET_COUNTER) {
     if (ty >= 238) {
       drawNumpadCancelButton(true);
@@ -1548,8 +1699,8 @@ void onTouchReleased(int32_t upX, int32_t upY) {
     }
 
     // Gesture Usap Layar (Swipe Left / Swipe Right) untuk Navigasi Halaman
-    // Bekerja di halaman 0, 1, 4, 5 (halaman 2 & 3 menggunakan dragging slider)
-    if (currentSettingsPage != 2 && currentSettingsPage != 3) {
+    // Bekerja di halaman 0, 1, 4, 5 (halaman 2 & 3 menggunakan dragging slider, halaman 6 untuk drawing)
+    if (currentSettingsPage != 2 && currentSettingsPage != 3 && currentSettingsPage != 6) {
       int32_t deltaX = upX - touchDownX;
       int32_t deltaY = upY - touchDownY;
       if (abs(deltaX) > 40 && abs(deltaX) > abs(deltaY) * 2) {
@@ -1713,6 +1864,16 @@ void onTouchReleased(int32_t upX, int32_t upY) {
       } else if (btnPowerOff.contains(touchDownX, touchDownY) &&
                  btnPowerOff.contains(upX, upY)) {
         executePowerOff();
+      }
+      break;
+    }
+    case 6: { // Page 7: Touch Diagnostic Canvas
+      int contentY = 44;
+      if (touchDownX >= 10 && touchDownX <= 66 && touchDownY >= (contentY + 2) && touchDownY <= (contentY + 24)) {
+        touchPaintCount = 0;
+        lastTouchPaintX = -1;
+        lastTouchPaintY = -1;
+        renderTouchCanvasPage();
       }
       break;
     }
@@ -2338,6 +2499,8 @@ void loop() {
           } else if (isSpeedDragging) {
             handleSpeedDrag(tx);
           }
+        } else if (currentSettingsPage == 6) {
+          handleTouchPaintDrag(tx, ty);
         }
       }
     }
@@ -2349,6 +2512,9 @@ void loop() {
       isBrightnessDragging = false;
       isForceDragging = false;
       isSpeedDragging = false;
+      if (currentSettingsPage == 6) {
+        handleTouchPaintRelease();
+      }
       onTouchReleased(releaseX, releaseY);
     }
   }
