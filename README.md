@@ -2,6 +2,8 @@
 
 Interactive IoT & Game platform using **Waveshare ESP32-S3-Touch-LCD-1.83** with Bluetooth Low Energy (BLE), real-time IMU motion tracking, power management (AXP2101 PMIC), and a desktop battery profiler suite.
 
+> 📘 **Manual Book Penggunaan Hardware**: Untuk panduan lengkap pengoperasian botol, tombol fisik, kalibrasi sensor, dan manajemen daya, silakan baca [**MANUAL_BOOK.md**](MANUAL_BOOK.md).
+
 ---
 
 ## 📌 Project Overview
@@ -85,6 +87,7 @@ COKE_SHAKE/
 │   └── Arduino_DriveBus.zip# Library Waveshare DriveBus
 ├── docs/                   # Aset gambar & dokumentasi
 │   └── coke_monitor_preview.png
+├── MANUAL_BOOK.md          # Buku panduan lengkap pengoperasian alat (Hardware)
 ├── .gitignore
 └── README.md
 ```
